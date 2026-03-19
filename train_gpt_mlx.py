@@ -77,6 +77,11 @@ class Hyperparameters:
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
+    # Depth recurrence: set NUM_UNIQUE_BLOCKS>0 and NUM_LOOPS>1 to share blocks.
+    # Effective depth = num_unique_blocks * num_loops. When disabled (default), uses num_layers unique blocks.
+    num_unique_blocks: int = int(os.environ.get("NUM_UNIQUE_BLOCKS", 0))
+    num_loops: int = int(os.environ.get("NUM_LOOPS", 1))
+
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -377,27 +382,46 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
+    # - encoder half accumulates skip tensors (baseline mode)
+    # - decoder half consumes reversed skips with learned skip_weights (baseline mode)
+    # - OR: depth recurrence with shared blocks looped multiple times
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, num_unique_blocks: int = 0, num_loops: int = 1):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.use_recurrence = num_unique_blocks > 0 and num_loops > 1
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
+
+        if self.use_recurrence:
+            self.num_unique_blocks = num_unique_blocks
+            self.num_loops = num_loops
+            self.blocks = [
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                for _ in range(num_unique_blocks)
+            ]
+            # No encoder/decoder split or skip connections in recurrence mode.
+            self.num_encoder_layers = 0
+            self.num_decoder_layers = 0
+            self.num_skip_weights = 0
+            self.skip_weights = mx.zeros((0, dim), dtype=mx.float32)
+        else:
+            self.num_unique_blocks = num_layers
+            self.num_loops = 1
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+            self.blocks = [
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                for _ in range(num_layers)
+            ]
+
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -414,18 +438,20 @@ class GPT(nn.Module):
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if self.use_recurrence:
+            for _loop in range(self.num_loops):
+                for block in self.blocks:
+                    x = block(x, x0)
+        else:
+            skips: list[mx.array] = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -495,7 +521,7 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if (k == "skip_weights" and p.size > 0) or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -885,6 +911,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        num_unique_blocks=args.num_unique_blocks,
+        num_loops=args.num_loops,
     )
     opt = SplitOptimizers(model, args)
 
@@ -919,11 +947,19 @@ def main() -> None:
     else:
         log(f"train_loader:dataset:{dataset_name} train_shards:{actual_train_files}/{expected_train_files}")
     log(f"tokenizer_path:{args.tokenizer_path}")
-    log(
-        f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
-        f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
-        f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
-    )
+    if model.use_recurrence:
+        log(
+            f"model_params:{n_params} vocab_size:{args.vocab_size} "
+            f"unique_blocks:{args.num_unique_blocks} loops:{args.num_loops} effective_layers:{args.num_unique_blocks * args.num_loops} "
+            f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+            f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        )
+    else:
+        log(
+            f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+            f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+            f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+        )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
