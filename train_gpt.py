@@ -1214,7 +1214,8 @@ def main() -> None:
                 else:
                     swa_count_f = float(swa_count)
                     for k in swa_state:
-                        swa_state[k] = swa_state[k] + (sd[k] - swa_state[k]) / (swa_count_f + 1)
+                        if swa_state[k].is_floating_point():
+                            swa_state[k] = swa_state[k] + (sd[k] - swa_state[k]) / (swa_count_f + 1)
                 swa_count += 1
 
         step += 1
@@ -1265,22 +1266,22 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(
-        base_model.state_dict(), quant_bits=args.quant_bits, fp16_embed=args.fp16_embed
-    )
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    if args.use_zstd:
-        import zstandard
-        quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
-        quant_ext = ".int8.zst"
-    else:
-        quant_blob = zlib.compress(quant_raw, level=9)
-        quant_ext = ".int8.ptz"
-    quant_raw_bytes = len(quant_raw)
-    quant_filename = f"final_model{quant_ext}"
     if master_process:
+        quant_obj, quant_stats = quantize_state_dict_int8(
+            base_model.state_dict(), quant_bits=args.quant_bits, fp16_embed=args.fp16_embed
+        )
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        if args.use_zstd:
+            import zstandard
+            quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
+            quant_ext = ".int8.zst"
+        else:
+            quant_blob = zlib.compress(quant_raw, level=9)
+            quant_ext = ".int8.ptz"
+        quant_raw_bytes = len(quant_raw)
+        quant_filename = f"final_model{quant_ext}"
         with open(quant_filename, "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize(quant_filename)
@@ -1291,6 +1292,10 @@ def main() -> None:
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
         log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes")
+
+    # Determine quant_filename on all ranks (needed for roundtrip eval below)
+    quant_ext = ".int8.zst" if args.use_zstd else ".int8.ptz"
+    quant_filename = f"final_model{quant_ext}"
 
     if distributed:
         dist.barrier()

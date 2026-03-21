@@ -98,6 +98,12 @@
 - Adding MLP3 + int6 increases quant gap to 0.030 — still usable, needs QAT to close
 - **This recipe is the path forward for H100 submission**
 
+### WD + LR sweep results
+- WD=0.02 + matrix_lr=0.02 is the best combo at 200 steps (-0.005 BPB over default)
+- WD=0.04 slightly worse than WD=0.02 at short training (may reverse at 10K+ steps on H100)
+- OvertoneInit + PhaseResidMix HURT when combined with WD+LR tuning — they conflict at short training
+- Best Mac recipe: SmearGate + BigramHash(4096) + WD=0.02 + LR=0.02 (no init tricks)
+
 ### Train at seq4096 needs H100 batch sizes
 - On Mac with batch=8192: only 2 seqs/step → severe underfitting (val_bpb 2.61 vs 2.34)
 - Top submissions use 393K+ tokens/step giving 96+ seqs at seq4096

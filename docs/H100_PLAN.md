@@ -1,18 +1,18 @@
 # Parameter Golf — H100 Execution Plan
 
-## Target: sub-1.14 BPB
+## Target: sub-1.12 BPB
 
-Current SOTA: 1.1428 (thwu1, 10L Int5-MLP + BigramHash(10240) + SWA(0.4) + WD=0.04)
+Current SOTA: 1.1254 (alertcat, TTT + XSA + EMA + SmearGate + BigramHash(2048) + Int6 QAT + zstd-22)
 
 ## Top 5 Breakdown
 
-| Rank | BPB | Layers | MLP | Seq | Quant | Key Differentiators |
-|---|---|---|---|---|---|---|
-| 1 (1.1428) | thwu1 | 10 | 3x | 2048 | int5 MLP / int6 attn | BigramHash(10240), SWA(0.4), WD=0.04 |
-| 2 (1.1458) | Raahil | 9 | 3x | 2048 | int6 | SmearGate, BigramHash(4096), SWA(0.5), WD=0.04 |
-| 3 (1.1502) | aruniyer | 11 | 3x | 2048 | int6 QAT | 11 layers, WD=0.04, zstd-22 |
-| 4 (1.1556) | aquarious | 9 | 3x | 1024 | int6 QAT | SmearGate, BigramHash, WD=0.01 |
-| 5 (1.1586) | yahya010 | 10 | 2.6x | 2048 | int6 QAT | MLP=1344, zero quant gap |
+| Rank | BPB | User | Key Differentiators |
+|---|---|---|---|
+| 1 | 1.1254 | alertcat | TTT + XSA + EMA + SmearGate + BigramHash(2048) + Int6 QAT + zstd-22 |
+| 2 | 1.1320 | saml212 | Gradient-guided adaptive quant + 12L + LN Scale + Partial RoPE |
+| 3 | 1.1428 | thwu1 | 10L, Int5 MLP / int6 attn, BigramHash(10240), SWA(0.4), WD=0.04 |
+| 4 | 1.1458 | Raahil | 9L, SmearGate, BigramHash(4096), SWA(0.5), WD=0.04 |
+| 5 | 1.1502 | aruniyer | 11L, int6 QAT, WD=0.04, zstd-22 |
 
 ## Consensus Techniques (all top 5 use)
 
@@ -27,45 +27,55 @@ Current SOTA: 1.1428 (thwu1, 10L Int5-MLP + BigramHash(10240) + SWA(0.4) + WD=0.
 
 ## What Separates #1 from the Pack
 
-1. **Int5 on MLP weights** — saves ~1.86MB vs int6, funding the 10th layer
-2. **BigramHash(10240)** — 2.5x larger hash table than #2's 4096 buckets (+0.001 BPB)
-3. **SWA start_frac=0.4** — only averages the most converged 40% of warmdown checkpoints
-4. **WD=0.04** — 4x higher than #4's 0.01, keeps weights small for better quantization
+1. **TTT (Test-Time Training)** — 3 epochs SGD on val tokens at eval time, ~+0.002 BPB free
+2. **XSA (Cross-Sequence Attention)** — last 4 layers attend across sequences in the batch
+3. **EMA** — exponential moving average of weights (decay=0.997) replaces SWA
+4. **SmearGate + BigramHash(2048)** — smaller hash table than old #1 but combined with TTT/XSA/EMA
+
+## What Separates #2 from #3–5
+
+1. **Gradient-guided adaptive quantization** — sensitivity-aware mixed precision, saves ~1MB
+2. **12 layers** — deepest submission on the board, funded by quant savings
+3. **LN Scale** — zero-param RMSNorm scaling that stabilizes deep networks
+4. **Partial RoPE** — rotary on only 25% of head dims, frees capacity for content
 
 ## Execution Phases
 
-### Phase 1: Reproduce #2's recipe (~3 runs, baseline)
+### Phase 1: Reproduce #4's recipe + new techniques (~3 runs, baseline)
 
 ```bash
-NUM_LAYERS=9 MLP_MULT=3 TRAIN_SEQ_LEN=2048 TRAIN_BATCH_TOKENS=786432
+NUM_LAYERS=9 MLP_MULT=3 TRAIN_SEQ_LEN=2048 TRAIN_BATCH_TOKENS=524288
 MUON_MOMENTUM=0.99 MUON_WEIGHT_DECAY=0.04 WARMDOWN_ITERS=3000
 MATRIX_LR=0.02 SCALAR_LR=0.02 TIED_EMBED_LR=0.03
 GRAD_CLIP_NORM=0.3 FP16_EMBED=1 EVAL_STRIDE=64
 USE_SMEARGATE=1 BIGRAM_HASH_BUCKETS=4096 BIGRAM_HASH_DIM=128
-# + int6 + zstd-22 + SWA + OrthoInit
+EMA_DECAY=0.997
+# + int6 + zstd-22 + OrthoInit
 ```
 
-Target: ~1.146. This is the proven stack.
+Target: ~1.146 with EMA instead of SWA, batch 524K for more steps.
 
-### Phase 2: Push toward #1 (~5 runs)
+### Phase 2: Push toward #2's recipe (~5 runs)
 
-- Add int5 on MLP weights → fund 10th layer
-- BigramHash(10240) instead of 4096
-- SWA start_frac=0.4 (tighter averaging window)
-- Try 11L (like #3) if int5 saves enough space
+- Add gradient-guided adaptive quantization (int7/int6/int5 mixed)
+- Use quant savings (~1MB) to fund 12th layer
+- Add LN Scale (`1/sqrt(layer_idx+1)`) for 12L stability
+- Add Partial RoPE (25% of head dims)
+- Keep batch=524K, EMA=0.997
 
-### Phase 3: Novel improvements (~10 runs)
+### Phase 3: Push toward #1 (~10 runs)
 
-- Try 11L + int5 MLP (not yet on leaderboard)
-- BigramHash(16384) — even larger table
-- QAT (zero quant gap like #5) + int5 (best compression)
-- Muon-aware QAT (Gaussian noise mode from PR #130)
+- Add XSA on last 4 layers
+- Add TTT (3 epochs SGD, lr=0.002, freeze first 2 blocks)
+- BigramHash sweep: 2048 vs 4096 vs 10240 (alertcat uses 2048 — smaller may be better with XSA)
+- Muon-aware QAT (Gaussian noise mode from PR #130) — but NOT late QAT at 12L (known negative result)
 - Explore WD sweep (0.02-0.06)
+- Try 11L vs 12L tradeoff (12L needs LN Scale + adaptive quant)
 
 ### Phase 4: Submission (~5 runs)
 
 - 3+ seeds on best config, p<0.01
-- Target: sub-1.14 BPB
+- Target: sub-1.12 BPB
 
 ## Implementation Needed for CUDA Port
 
@@ -76,6 +86,46 @@ Target: ~1.146. This is the proven stack.
 5. **Int5 quantization** — ~10 lines (extend int6 to support step=8)
 6. **zstd-22** — swap zlib for zstandard
 7. **QAT with STE** — ~20 lines (fake quantize in forward pass)
+
+## New Techniques from Latest Leaderboard
+
+### TTT (Test-Time Training)
+3 epochs SGD on val tokens during eval, lr=0.002, freeze first 2 blocks. Runs in ~47s on 8xH100.
+Effectively free BPB improvement (~+0.002 BPB) since it runs at eval time, not training time.
+The model fine-tunes itself on the validation distribution before being scored.
+
+### Gradient-Guided Adaptive Quantization
+Accumulate squared gradients during the last 10% of warmdown. Rank tensors by sensitivity:
+- Top 10% (highest grad magnitude) → int7
+- Middle 70% → int6
+- Bottom 20% (least sensitive) → int5
+
+Saves ~1MB vs uniform int6 → enough budget to fund a 12th transformer layer.
+
+### LN Scale
+RMSNorm output scaled by `1/sqrt(layer_idx + 1)`. Damps activations in deeper layers.
+Zero additional parameters. Stabilizes training for 12L models that otherwise diverge.
+
+### Partial RoPE
+Apply rotary position embeddings on only 25% of head dimensions (16 of 64).
+Remaining 75% are position-free, acting as content-only dimensions.
+Reduces RoPE's interference with learned attention patterns.
+
+### EMA (Exponential Moving Average)
+Maintain a shadow copy of weights with decay=0.997, updated every step.
+Use the EMA weights for final export. Replaces SWA in alertcat's submission.
+
+### XSA (Cross-Sequence Attention)
+Last 4 layers attend across all sequences in the batch (not just within-sequence).
+Allows the model to leverage inter-sequence context at eval time.
+
+### Batch Size 524K (vs 786K)
+Smaller batch = 22% more gradient steps at the same wallclock budget.
+More updates can matter more than larger batches when training is step-limited.
+
+## Negative Results
+
+- **Late QAT at 12 layers**: Harmful at -0.004 BPB. The step overhead of fake-quantize ops in the forward pass costs too many training steps when the model is already deep. Better to use post-training quantization with gradient-guided sensitivity ranking.
 
 ## Key Architecture Details from Top Submissions
 

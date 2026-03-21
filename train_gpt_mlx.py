@@ -90,6 +90,9 @@ class Hyperparameters:
     # Architecture additions.
     use_loop_embed: bool = bool(int(os.environ.get("USE_LOOP_EMBED", "0")))
     use_dwa: bool = bool(int(os.environ.get("USE_DWA", "0")))
+    use_smeargate: bool = bool(int(os.environ.get("USE_SMEARGATE", "0")))
+    bigram_hash_buckets: int = int(os.environ.get("BIGRAM_HASH_BUCKETS", 0))
+    bigram_hash_dim: int = int(os.environ.get("BIGRAM_HASH_DIM", 128))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -141,7 +144,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,dwa_logits,loop_embeds",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,dwa_logits,loop_embeds,smear_gate",
     ).split(",")
     if pattern
 )
@@ -406,7 +409,8 @@ class GPT(nn.Module):
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
                  qk_gain_init: float, num_unique_blocks: int = 0, num_loops: int = 1,
                  use_loop_embed: bool = False, use_dwa: bool = False,
-                 overtone_init: bool = False, phase_resid_mix: bool = False):
+                 overtone_init: bool = False, phase_resid_mix: bool = False,
+                 use_smeargate: bool = False, bigram_hash_buckets: int = 0, bigram_hash_dim: int = 128):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -456,6 +460,17 @@ class GPT(nn.Module):
         else:
             self._effective_depth = 0
 
+        # BigramHash: hash table mapping token pairs to learned embeddings.
+        self.bigram_hash_buckets = bigram_hash_buckets
+        if bigram_hash_buckets > 0:
+            self.bigram_table = mx.random.normal((bigram_hash_buckets, bigram_hash_dim)) * 0.01
+            self.bigram_proj = mx.random.normal((bigram_hash_dim, dim)) * (bigram_hash_dim ** -0.5)
+
+        # SmearGate: learned gate blending current token with previous token embedding.
+        self.use_smeargate = use_smeargate
+        if use_smeargate:
+            self.smear_gate = mx.full((dim,), 3.0, dtype=mx.float32)  # sigmoid(3) ≈ 0.95
+
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -487,7 +502,22 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array, num_loops_override: int = 0) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = self.tok_emb(input_ids).astype(COMPUTE_DTYPE)
+
+        # BigramHash: add token-pair embeddings before normalization.
+        if self.bigram_hash_buckets > 0:
+            prev_ids = mx.concatenate([input_ids[:, :1], input_ids[:, :-1]], axis=1)
+            hash_idx = (prev_ids * 31 + input_ids) % self.bigram_hash_buckets
+            bigram_emb = mx.take(self.bigram_table, hash_idx.reshape(-1), axis=0).reshape(*input_ids.shape, -1)
+            x = x + (bigram_emb @ self.bigram_proj.astype(x.dtype))
+
+        # SmearGate: blend current token with previous token embedding.
+        if self.use_smeargate:
+            gate = mx.sigmoid(self.smear_gate).astype(x.dtype)
+            prev_x = mx.concatenate([mx.zeros_like(x[:, :1]), x[:, :-1]], axis=1)
+            x = gate * x + (1.0 - gate) * prev_x
+
+        x = rms_norm(x)
         x0 = x
 
         if self.use_recurrence:
@@ -587,7 +617,7 @@ class SplitOptimizers:
             k
             for k, p in params.items()
             if (k == "skip_weights" and p.size > 0)
-            or (k in ("dwa_logits", "loop_embeds") and p.size > 0)
+            or (k in ("dwa_logits", "loop_embeds", "bigram_table", "bigram_proj", "smear_gate") and p.size > 0)
             or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
@@ -922,6 +952,9 @@ def eval_val(
         bytes_arr += (has_leading_space_lut[tgt_np] & ~is_boundary_token_lut[prev_np]).astype(np.int16, copy=False)
         total_scored += tgt_np.size
         total_bytes += float(bytes_arr.astype(np.float64).sum())
+        # Periodically materialize to prevent lazy graph from growing unbounded.
+        if (b_start // val_batch_seqs) % 50 == 49:
+            mx.eval(total_loss)
 
     total_loss = total_loss / total_scored
     mx.eval(total_loss)
@@ -1026,6 +1059,9 @@ def main() -> None:
         use_dwa=args.use_dwa,
         overtone_init=args.overtone_init,
         phase_resid_mix=args.phase_resid_mix,
+        use_smeargate=args.use_smeargate,
+        bigram_hash_buckets=args.bigram_hash_buckets,
+        bigram_hash_dim=args.bigram_hash_dim,
     )
     opt = SplitOptimizers(model, args)
 
