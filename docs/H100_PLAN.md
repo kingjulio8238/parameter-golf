@@ -77,15 +77,21 @@ Target: ~1.146 with EMA instead of SWA, batch 524K for more steps.
 - 3+ seeds on best config, p<0.01
 - Target: sub-1.12 BPB
 
-## Implementation Needed for CUDA Port
+## Implementation Status
 
-1. **SmearGate** — ~20 lines (gate + prev token blending)
-2. **BigramHash** — ~30 lines (hash table + projection)
-3. **SWA** — ~15 lines (checkpoint averaging in warmdown)
-4. **OrthoInit** — ~10 lines (orthogonal_ on weight matrices)
-5. **Int5 quantization** — ~10 lines (extend int6 to support step=8)
-6. **zstd-22** — swap zlib for zstandard
-7. **QAT with STE** — ~20 lines (fake quantize in forward pass)
+### Already implemented in train_gpt.py (CUDA):
+- SmearGate, BigramHash, SWA, OrthoInit, OvertoneInit, PhaseResidMix
+- Int5/Int6 quantization, QAT with STE, zstd-22, FP16 embed
+- Sliding window eval, Muon WD
+- Bug fixes: SWA float guard, rank-guarded quantization
+
+### Still needed for H100 (implement on pod):
+1. **EMA** — shadow weight copy with decay=0.997 (~15 lines, replaces SWA in Phase 1)
+2. **TTT** — SGD fine-tuning on val tokens at eval time (~30 lines, Phase 3)
+3. **XSA** — cross-sequence attention on last N layers (~25 lines, Phase 3)
+4. **Gradient-guided adaptive quant** — per-tensor sensitivity ranking (~20 lines, Phase 2)
+5. **LN Scale** — `1/sqrt(layer_idx+1)` in RMSNorm (~5 lines, Phase 2)
+6. **Partial RoPE** — rotary on 25% of head dims (~10 lines, Phase 2)
 
 ## New Techniques from Latest Leaderboard
 
