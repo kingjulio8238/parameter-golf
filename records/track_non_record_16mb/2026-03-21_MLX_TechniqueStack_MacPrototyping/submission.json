@@ -1,0 +1,13 @@
+{
+  "author": "Julian Saks",
+  "github_id": "kingjulio8238",
+  "name": "MLX Technique Stack — Mac Prototyping",
+  "blurb": "25+ MLX experiments validating leaderboard techniques. Near-zero quant gap (0.001 BPB). Pending H100.",
+  "date": "2026-03-21",
+  "val_loss": 3.3073,
+  "val_bpb": 1.9588,
+  "bytes_total": 12288584,
+  "bytes_code": 52000,
+  "hardware": "Apple Silicon (MLX)",
+  "note": "Non-record, Mac-only. Supporting compute grant application."
+}
